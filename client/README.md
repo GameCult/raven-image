@@ -5,8 +5,8 @@ file, standard library only, plus the ComfyUI API graph it submits.
 
 **Value:** a Mind can make concept art with one command and no ComfyUI knowledge.
 **Entry points:** `raven-image` (the client), `graphs/flux3-klein.json` (the graph).
-**Live:** Klein t2i with the prompt upsampler. **Also live:** `--ref` reference-conditioned edit (below). **Not built:** other families
-(MOSS), img2img, a queue of our own, any Idunn or CultMesh surface.
+**Live:** Klein t2i with the prompt upsampler. **Also live:** `--ref` reference-conditioned edit and `--margin` clear edges (below). **Not built:** other families
+(MOSS), img2img, a custom sampler node (not needed: see `--margin`), a queue of our own, any Idunn or CultMesh surface.
 
 ```
 raven-image "concept art: a lighthouse on a basalt cliff at dusk" -o out.png
@@ -39,7 +39,48 @@ Test 2026-11-11, Kiko's r1a 12-cell pose sheet as the only reference, same seed:
 but also pasted three of the sheet's cells into the frame; use one cropped cell as the reference. Images and verdict:
 `/opt/commons/handoff/raven-ref-edit-20261111/`.
 
-Offline test (fake ComfyUI on 127.0.0.1): `python3 scripts/test-raven-image.py` in gamecult-ops.
+## `--margin PCT`: clear edges by construction
+
+```
+raven-image "a goldfish mascot on a plain pale cream background" --no-enhance --margin 6 --bg fcf7ee -o fish.png
+raven-image ... --margin 6 --bg 12fa5f --alpha -o sticker.png      # RGBA, backdrop keyed out
+```
+
+The border band (PCT of each axis, rounded up to the 16 px latent grid, 6% of 1024 is 64 px) is held flat during
+diffusion, not cleaned afterwards. The client replaces the empty latent with a `--bg`-coloured image run through the
+graph's own VAE (`EmptyImage` > `VAEEncode`) and puts a `SetLatentNoiseMask` on it that is 0 on the band and 1 inside
+(`SolidMask` + `MaskComposite`, nodes 30-35; node 6 goes). ComfyUI's sampler re-imposes the masked-out latent at every
+step at that step's noise level (RePaint-style), so the model composes the interior around a frame it cannot change.
+Core nodes only; no custom node, no Raven deploy. Denoise stays 1. Works on `flux3-klein` and `flux3-klein-edit`
+(with or without `--vision`). Put the same backdrop in the prompt ("plain pale cream background"); the pin sets the band,
+the prompt sets what the interior tries to match.
+
+After the render the client measures the band against its own backdrop (the per-channel median of the band: the VAE
+shifts a saturated `--bg` by tens of levels, `#12fa5f` came back `#1fef6d`; cream stayed within 2), repaints the whole
+band with that colour (if the median is more than 48 levels from `--bg` on any channel the band is mostly content, and
+`--bg` is the reference instead, so a band of subject cannot pass as its own backdrop; the guarantee is a flat band within 48 levels of `--bg`, so a band that is uniformly 30 levels off, which the VAE can do to a saturated colour, passes), and prints it with the per-side count of pixels that were content:
+`margin 6.0%: backdrop #fef9ec, cleared 802 of 245760 band px (0.33%; left 646 top 0 right 156 bottom 0)`.
+If more than `--max-clip` percent of the band (default 0.5) was content the file is still written, already cleared, and
+the client exits **65**: the subject ran into the frame, so it is cut flat at the seam. Re-seed or ask for more room.
+`-n` renders all images, then exits 65 if any was dirty (a later Busy still exits 75 and says how many earlier images were dirty; an unreadable render is reported, skipped, and exits 1 at the end). `--size` must be multiples of 16 and the margin must leave an interior of at least 16 px per axis. `--alpha` floods from the band through backdrop-coloured pixels
+and makes them transparent (hard key; pure Python, about 1 s). The output is RGBA only with `--alpha`.
+
+Measured 2026-11-11 (1024x1024, 6%, one render each, same seed and ref as the unpinned image):
+
+| case | unpinned: band that was content | pinned |
+|---|---|---|
+| Aqua's facelift seed 2203 (`--ref --vision`, seaweed and bubbles in the corners) | 33% | 0.33% (corners clean; character unchanged) |
+| Kiko r1a at a desk, seed 11 (green) | 31% (the desk ran off the bottom) | 0.43% (the desk now ends inside the frame) |
+
+Pinned and unpinned images, the comparison, and the raw (unrepainted) pinned renders `*-pin6-raw.png` that the pinned numbers are measured on: `/opt/commons/handoff/raven-ref-edit-20261111/clear-edge/`. The images show the result, not the per-step mechanism; that rests on ComfyUI's sampler (its denoise-mask path), and the evidence here is the band: 0 to 0.5% content in nine pinned renders against 31 to 33% unpinned. The pin
+did not visibly degrade either render. The residue is subject touching the seam (fin, tail, desk corner), not clutter.
+Limits: a hard key leaves a faint backdrop-coloured fringe on antialiased outlines (visible on saturated green, faint on
+cream); backdrop enclosed by the subject (the gap between a headband and the head) stays opaque; a saturated key colour
+the subject also contains (green in a green-eyed character) is untouched except where connected to the band; the band is
+a rectangle, so the pin cannot ask for a vignette or a round sticker. A subject cannot be asked to stay off the seam: only
+the exit code tells you it did not.
+
+Offline test (fake ComfyUI on 127.0.0.1, 159 checks): `python3 tests/test-raven-image.py`.
 
 ## What it does
 
