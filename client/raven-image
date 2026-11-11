@@ -10,6 +10,7 @@ import argparse, json, math, os, random, re, stat, struct, sys, time, urllib.err
 BASE = os.environ.get("RAVEN_URL", "http://10.77.0.4:8190")
 EX_BUSY = 75  # EX_TEMPFAIL: no answer from Raven (off, busy, a read timeout mid-render, or a lock screen after a reboot); try again later, by hand
 EX_DIRTY = 65  # EX_DATAERR: --margin was asked for and the render put subject in the band; the file is written, already cleared
+BG_TOL = 48  # per-channel: how far the band's decoded median may sit from --bg (saturated colours came back 18 levels off) before it is content, not backdrop
 TOL = 12  # per-channel distance from the band's backdrop beyond which a pixel counts as content (VAE noise on a flat fill is a few levels)
 MAX_REF = 20 * 2 ** 20  # bytes; refs persist in Raven's input folder, so cap what we put there
 MAGIC = ((b"\x89PNG\r\n\x1a\n", None), (b"\xff\xd8\xff", None), (b"RIFF", b"WEBP"))  # png, jpeg, webp (bytes 8-12)
@@ -147,6 +148,8 @@ def png_decode(data):
     while pos < len(data):
         n, typ = struct.unpack(">I4s", data[pos:pos + 8])
         body = data[pos + 8:pos + 8 + n]
+        if len(body) != n or struct.unpack(">I", data[pos + 8 + n:pos + 12 + n])[0] != zlib.crc32(typ + body):
+            raise ValueError("bad chunk length or CRC")
         pos += 12 + n
         if typ == b"IHDR":
             hdr = struct.unpack(">IIBBBBB", body)
@@ -157,6 +160,8 @@ def png_decode(data):
     if hdr is None or not idat:
         raise ValueError("no IHDR or no image data")
     w, h, depth, ctype, _, _, interlace = hdr
+    if not 0 < w * h <= 2 ** 26:
+        raise ValueError(f"image size {w}x{h} is out of range")
     if depth != 8 or ctype not in (2, 6) or interlace:
         raise ValueError(f"only 8-bit non-interlaced RGB/RGBA is handled (got depth {depth}, colour type {ctype}, interlace {interlace})")
     bpp = 3 if ctype == 2 else 4
@@ -210,7 +215,7 @@ def key_alpha(w, h, bpp, rows, back):
     return out
 
 
-def clear_edges(png, pct, alpha=False):
+def clear_edges(png, pct, alpha=False, bg=None):
     """Measure the border band of a rendered PNG against its own backdrop (the per-channel median of the band: the VAE
     shifts a saturated --bg by tens of levels, so the asked-for colour is not what a clean band decodes to), paint the
     whole band with that backdrop, and report what was content. Returns (png bytes, backdrop (r, g, b), clipped pixels per
@@ -224,6 +229,10 @@ def clear_edges(png, pct, alpha=False):
             for x in range(x0, x1, 3):
                 for c in range(3): sample[c].append(rows[y][x * bpp + c])
     back = tuple(sorted(v)[len(v) // 2] for v in sample)
+    if bg is not None:  # the median is only a backdrop if it is the pinned colour, up to the VAE's shift; else the band is content
+        want_bg = ((bg >> 16) & 255, (bg >> 8) & 255, bg & 255)
+        if any(abs(back[c] - want_bg[c]) > BG_TOL for c in range(3)):
+            back = want_bg
     want = bytes(back + ((255,) if bpp == 4 else ()))
     clip = dict.fromkeys(("left", "top", "right", "bottom"), 0)
 
@@ -316,10 +325,14 @@ def main():
     bg = int(a.bg.lstrip("#"), 16)
     a.graph = a.graph or ("flux3-klein-edit" if a.ref else "flux3-klein")
     ref_data = [load_ref(r) for r in a.ref]  # everything refusable is refused before the first request
+    if not re.fullmatch(r"\d+x\d+", a.size.lower()) or any(int(v) % 16 or not int(v) for v in a.size.lower().split("x")):
+        ap.error("--size is WxH in multiples of 16, e.g. 1024x1024")
     w, h = (int(v) for v in a.size.lower().split("x"))
+    if a.margin and any(d - 2 * m < 16 for d, m in zip((w, h), margin_px(a.margin, w, h))):
+        ap.error(f"--margin {a.margin}% leaves no room inside {w}x{h} (the interior must keep at least 16 px per axis)")
     seed0 = a.seed if a.seed is not None else random.randrange(2 ** 48)
     root, ext = os.path.splitext(a.out)
-    dirty = 0
+    dirty = broken = 0
     try:
         call("GET", "/system_stats", timeout=5)
         refs = [upload(r, d) for r, d in zip(a.ref, ref_data)]
@@ -333,9 +346,11 @@ def main():
             note = ""
             if a.margin:
                 try:
-                    png, back, clip, band = clear_edges(png, a.margin, a.alpha)
-                except (ValueError, zlib.error, struct.error) as e:
-                    sys.exit(f"raven-image: --margin: cannot read the render as a PNG ({e}); nothing written")
+                    png, back, clip, band = clear_edges(png, a.margin, a.alpha, bg)
+                except (ValueError, zlib.error, struct.error, MemoryError) as e:
+                    broken += 1
+                    print(f"raven-image: --margin: image {i + 1} (seed {seed}): cannot read the render as a PNG ({e}); not written", file=sys.stderr)
+                    continue
                 pct = 100 * sum(clip.values()) / band
                 note = "  margin %s%%: backdrop #%02x%02x%02x, cleared %d of %d band px (%.2f%%; %s)" % (
                     a.margin, *back, sum(clip.values()), band, pct, " ".join(f"{k} {v}" for k, v in clip.items()))
@@ -347,12 +362,14 @@ def main():
             print(f"{path}  seed={seed}  {w}x{h}  {time.time() - t:.0f}s{note}", flush=True)
         if not a.keep_loaded:
             print("freed Raven's VRAM" if free_if_idle() else "queue not empty, left models loaded")
+        if broken:
+            sys.exit(1)
         if dirty:
             sys.exit(EX_DIRTY)
     except Busy as e:
         print(f"raven-image: Raven may be busy or off ({BASE}: {e}). Not retrying; try again later. "
               "Most likely cause after a Raven reboot: the lock screen (the ComfyUI task needs someone logged in on Raven's desktop). "
-              "A read timeout mid-render also lands here.", file=sys.stderr)
+              "A read timeout mid-render also lands here." + (f" {dirty} earlier image(s) were DIRTY." if dirty else ""), file=sys.stderr)
         sys.exit(EX_BUSY)
 
 

@@ -57,11 +57,12 @@ the prompt sets what the interior tries to match.
 
 After the render the client measures the band against its own backdrop (the per-channel median of the band: the VAE
 shifts a saturated `--bg` by tens of levels, `#12fa5f` came back `#1fef6d`; cream stayed within 2), repaints the whole
-band with that colour, and prints it with the per-side count of pixels that were content:
+band with that colour (if the median is more than 48 levels from `--bg` on any channel the band is mostly content, and
+`--bg` is the reference instead, so a band of subject cannot pass as its own backdrop), and prints it with the per-side count of pixels that were content:
 `margin 6.0%: backdrop #fef9ec, cleared 802 of 245760 band px (0.33%; left 646 top 0 right 156 bottom 0)`.
 If more than `--max-clip` percent of the band (default 0.5) was content the file is still written, already cleared, and
 the client exits **65**: the subject ran into the frame, so it is cut flat at the seam. Re-seed or ask for more room.
-`-n` renders all images, then exits 65 if any was dirty. `--alpha` floods from the band through backdrop-coloured pixels
+`-n` renders all images, then exits 65 if any was dirty (a later Busy still exits 75 and says how many earlier images were dirty; an unreadable render is reported, skipped, and exits 1 at the end). `--size` must be multiples of 16 and the margin must leave an interior of at least 16 px per axis. `--alpha` floods from the band through backdrop-coloured pixels
 and makes them transparent (hard key; pure Python, about 1 s). The output is RGBA only with `--alpha`.
 
 Measured 2026-11-11 (1024x1024, 6%, one render each, same seed and ref as the unpinned image):
@@ -71,7 +72,7 @@ Measured 2026-11-11 (1024x1024, 6%, one render each, same seed and ref as the un
 | Aqua's facelift seed 2203 (`--ref --vision`, seaweed and bubbles in the corners) | 33% | 0.33% (corners clean; character unchanged) |
 | Kiko r1a at a desk, seed 11 (green) | 31% (the desk ran off the bottom) | 0.43% (the desk now ends inside the frame) |
 
-Pinned and unpinned images and the comparison: `/opt/commons/handoff/raven-ref-edit-20261111/clear-edge/`. The pin
+Pinned and unpinned images, the comparison, and the raw (unrepainted) pinned renders `*-pin6-raw.png` that the pinned numbers are measured on: `/opt/commons/handoff/raven-ref-edit-20261111/clear-edge/`. The images show the result, not the per-step mechanism; that rests on ComfyUI's sampler (its denoise-mask path), and the evidence here is the band: 0 to 0.5% content in nine pinned renders against 31 to 33% unpinned. The pin
 did not visibly degrade either render. The residue is subject touching the seam (fin, tail, desk corner), not clutter.
 Limits: a hard key leaves a faint backdrop-coloured fringe on antialiased outlines (visible on saturated green, faint on
 cream); backdrop enclosed by the subject (the gap between a headband and the head) stays opaque; a saturated key colour
@@ -79,7 +80,7 @@ the subject also contains (green in a green-eyed character) is untouched except 
 a rectangle, so the pin cannot ask for a vignette or a round sticker. A subject cannot be asked to stay off the seam: only
 the exit code tells you it did not.
 
-Offline test (fake ComfyUI on 127.0.0.1, 127 checks): `python3 tests/test-raven-image.py`.
+Offline test (fake ComfyUI on 127.0.0.1, 146 checks): `python3 tests/test-raven-image.py`.
 
 ## What it does
 
