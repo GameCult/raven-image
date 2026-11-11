@@ -148,7 +148,7 @@ def png_decode(data):
     while pos < len(data):
         n, typ = struct.unpack(">I4s", data[pos:pos + 8])
         body = data[pos + 8:pos + 8 + n]
-        if len(body) != n or struct.unpack(">I", data[pos + 8 + n:pos + 12 + n])[0] != zlib.crc32(typ + body):
+        if struct.unpack(">I", data[pos + 8 + n:pos + 12 + n])[0] != zlib.crc32(typ + body):
             raise ValueError("bad chunk length or CRC")
         pos += 12 + n
         if typ == b"IHDR":
@@ -160,8 +160,6 @@ def png_decode(data):
     if hdr is None or not idat:
         raise ValueError("no IHDR or no image data")
     w, h, depth, ctype, _, _, interlace = hdr
-    if not 0 < w * h <= 2 ** 26:
-        raise ValueError(f"image size {w}x{h} is out of range")
     if depth != 8 or ctype not in (2, 6) or interlace:
         raise ValueError(f"only 8-bit non-interlaced RGB/RGBA is handled (got depth {depth}, colour type {ctype}, interlace {interlace})")
     bpp = 3 if ctype == 2 else 4

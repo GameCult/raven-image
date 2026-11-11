@@ -58,7 +58,7 @@ the prompt sets what the interior tries to match.
 After the render the client measures the band against its own backdrop (the per-channel median of the band: the VAE
 shifts a saturated `--bg` by tens of levels, `#12fa5f` came back `#1fef6d`; cream stayed within 2), repaints the whole
 band with that colour (if the median is more than 48 levels from `--bg` on any channel the band is mostly content, and
-`--bg` is the reference instead, so a band of subject cannot pass as its own backdrop), and prints it with the per-side count of pixels that were content:
+`--bg` is the reference instead, so a band of subject cannot pass as its own backdrop; the guarantee is a flat band within 48 levels of `--bg`, so a band that is uniformly 30 levels off, which the VAE can do to a saturated colour, passes), and prints it with the per-side count of pixels that were content:
 `margin 6.0%: backdrop #fef9ec, cleared 802 of 245760 band px (0.33%; left 646 top 0 right 156 bottom 0)`.
 If more than `--max-clip` percent of the band (default 0.5) was content the file is still written, already cleared, and
 the client exits **65**: the subject ran into the frame, so it is cut flat at the seam. Re-seed or ask for more room.
@@ -80,7 +80,7 @@ the subject also contains (green in a green-eyed character) is untouched except 
 a rectangle, so the pin cannot ask for a vignette or a round sticker. A subject cannot be asked to stay off the seam: only
 the exit code tells you it did not.
 
-Offline test (fake ComfyUI on 127.0.0.1, 146 checks): `python3 tests/test-raven-image.py`.
+Offline test (fake ComfyUI on 127.0.0.1, 158 checks): `python3 tests/test-raven-image.py`.
 
 ## What it does
 

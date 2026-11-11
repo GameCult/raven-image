@@ -292,16 +292,32 @@ for nm, sc, probe in (("vertical", pocket_v, (80, 90)), ("horizontal", pocket_h,
     _, _, bpp_, rows_, _ = mod2.png_decode(pic)
     w2, h2, bpp2, rows2, keep2 = mod2.png_decode(mod2.clear_edges(pic, 6, True, 0x1ec85a)[0])
     check(rows2[probe[1]][probe[0] * 4 + 3] == 0, f"flood fill: backdrop pocket behind a 1-px {nm} corridor is keyed out")
-# decoder hardening: a flipped byte breaks the CRC, a huge IHDR is refused before allocation
+# BG_TOL: a flat band within 48 levels of --bg is the pinned colour after the VAE's shift (observed up to 30), repainted as the band's own colour; 49 is content
+for off, want_clean in ((48, True), (49, False)):
+    flat = (BG[0] + off, BG[1], BG[2])
+    p_, back4, clip4, band4 = mod2.clear_edges(mkpng(160, 160, lambda x, y, f=flat: f), 6, False, 0x1ec85a)
+    check((sum(clip4.values()) == 0) == want_clean and back4 == (flat if want_clean else BG), f"BG_TOL: flat band {off} levels off --bg {'is' if want_clean else 'is not'} a backdrop ({back4}, {sum(clip4.values())} cleared)")
+    if want_clean:
+        r4 = mod2.png_decode(p_)[3]
+        check(bytes(r4[3][3:6]) == bytes(flat), "BG_TOL: a clean band is repainted with its own colour, so the seam stays invisible")
+# decoder hardening: a flipped byte breaks the CRC, and every size check refuses on its own (each blob is otherwise well-formed)
+def ck(t, b): return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+def blob(w, h, depth=8, ctype=2, idat=None, il=0):
+    return (b"\x89PNG\r\n\x1a\n" + ck(b"IHDR", struct.pack(">IIBBBBB", w, h, depth, ctype, 0, 0, il))
+            + ck(b"IDAT", idat if idat is not None else zlib.compress(b"\0" * (h * (w * 3 + 1)) if w * h < 10 ** 7 else b"")) + ck(b"IEND", b""))
 good = mkpng(8, 8, lambda x, y: BG)
 bad = bytearray(good); bad[40] ^= 1
-for blob, what in ((bytes(bad), "flipped byte"), (good[:16] + struct.pack(">II", 60000, 60000) + good[24:], "huge IHDR")):
-    try: mod2.png_decode(blob); check(False, f"png_decode refuses {what}")
+for data, what in ((bytes(bad), "flipped byte (CRC)"), (blob(2 ** 21, 2 ** 21), "a header that promises far more than the data"), (blob(8, 8, idat=zlib.compress(b"\0" * (8 * 25 - 1))), "image data shorter than the header says"),
+                   (blob(8, 8, idat=zlib.compress(b"\0" * (8 * 25 + 500))), "image data longer than the header says"), (blob(8, 8, depth=16), "16-bit"),
+                   (blob(8, 8, ctype=3), "palette"), (blob(8, 8, il=1), "interlaced"), (good[:-20], "truncated"),
+                   (good[:8] + struct.pack(">I", 10 ** 6) + good[12:], "chunk length past the end")):
+    try: mod2.png_decode(data); check(False, f"png_decode refuses {what}")
     except (ValueError, zlib.error, struct.error): check(True, "")
 # size and interior validation, before any request
 refused(["--size", "foo", "cap"], "--size is WxH", "--size foo")
 refused(["--size", "1000x1024", "cap"], "multiples of 16", "--size not on the grid")
 refused(["--margin", "40", "--size", "64x64", "cap"], "leaves no room", "margin eating the interior")
+refused(["--margin", "5", "--size", "32x512", "cap"], "leaves no room", "margin eating one axis only")
 # -n: a dirty image is not forgotten by a later one; an unreadable render is reported, not fatal to the batch
 seen["view"] = mkpng(160, 160, lambda x, y: RED if x < 12 else BG)
 p, g = run("--margin", "6", "--bg", "1ec85a", "-n", "2", "--size", "160x160", "--no-enhance", "cap")
