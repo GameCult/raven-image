@@ -5,10 +5,12 @@ Talks to ComfyUI's own API: POST /prompt, poll GET /history/<id>, GET /view,
 POST /free when the queue is empty. No retry loop: an unreachable Raven exits 75
 with "Raven may be busy or off". See README.md next to this file.
 """
-import argparse, json, math, os, random, stat, sys, time, urllib.error, urllib.parse, urllib.request
+import argparse, json, math, os, random, re, stat, struct, sys, time, urllib.error, urllib.parse, urllib.request, zlib
 
 BASE = os.environ.get("RAVEN_URL", "http://10.77.0.4:8190")
 EX_BUSY = 75  # EX_TEMPFAIL: no answer from Raven (off, busy, a read timeout mid-render, or a lock screen after a reboot); try again later, by hand
+EX_DIRTY = 65  # EX_DATAERR: --margin was asked for and the render put subject in the band; the file is written, already cleared
+TOL = 12  # per-channel distance from the band's backdrop beyond which a pixel counts as content (VAE noise on a flat fill is a few levels)
 MAX_REF = 20 * 2 ** 20  # bytes; refs persist in Raven's input folder, so cap what we put there
 MAGIC = ((b"\x89PNG\r\n\x1a\n", None), (b"\xff\xd8\xff", None), (b"RIFF", b"WEBP"))  # png, jpeg, webp (bytes 8-12)
 
@@ -118,6 +120,133 @@ def build(name, text, w, h, seed, enhance, refs=(), vision=False):
     return g
 
 
+def margin_px(pct, w, h):
+    """Band width on each axis in pixels: pct of that axis, rounded up to the 16-px latent grid so the mask edge is exact."""
+    return tuple(-(-math.ceil(pct / 100 * d) // 16) * 16 for d in (w, h))
+
+
+def pin_edges(g, w, h, pct, bg):
+    """Native pin: sample from a flat --bg latent with a noise mask that is 0 on the border band, so the band is
+    re-imposed at every step and the model composes the interior around it. Replaces node 6 (the empty latent)."""
+    mx, my = margin_px(pct, w, h)
+    g["30"] = {"class_type": "EmptyImage", "inputs": {"width": w, "height": h, "batch_size": 1, "color": bg}}
+    g["31"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["30", 0], "vae": ["3", 0]}}
+    g["32"] = {"class_type": "SolidMask", "inputs": {"value": 0.0, "width": w, "height": h}}  # 0 = keep, 1 = sample
+    g["33"] = {"class_type": "SolidMask", "inputs": {"value": 1.0, "width": w - 2 * mx, "height": h - 2 * my}}
+    g["34"] = {"class_type": "MaskComposite", "inputs": {"destination": ["32", 0], "source": ["33", 0], "x": mx, "y": my, "operation": "add"}}
+    g["35"] = {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["31", 0], "mask": ["34", 0]}}
+    g["7"]["inputs"]["latent_image"] = ["35", 0]
+    del g["6"]
+
+
+def png_decode(data):
+    """8-bit non-interlaced RGB/RGBA PNG (what ComfyUI writes) -> (w, h, bpp, rows, ancillary chunks). Stdlib only."""
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("not a png")
+    pos, idat, keep, hdr = 8, [], [], None
+    while pos < len(data):
+        n, typ = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + n]
+        pos += 12 + n
+        if typ == b"IHDR":
+            hdr = struct.unpack(">IIBBBBB", body)
+        elif typ == b"IDAT":
+            idat.append(body)
+        elif typ != b"IEND":
+            keep.append((typ, body))
+    if hdr is None or not idat:
+        raise ValueError("no IHDR or no image data")
+    w, h, depth, ctype, _, _, interlace = hdr
+    if depth != 8 or ctype not in (2, 6) or interlace:
+        raise ValueError(f"only 8-bit non-interlaced RGB/RGBA is handled (got depth {depth}, colour type {ctype}, interlace {interlace})")
+    bpp = 3 if ctype == 2 else 4
+    stride, rows, prev = w * bpp, [], bytearray(w * bpp)
+    raw = zlib.decompressobj().decompress(b"".join(idat), h * (stride + 1) + 1)  # bounded: a bomb cannot outgrow its header
+    if len(raw) != h * (stride + 1):
+        raise ValueError("image data does not match the header size")
+    for y in range(h):
+        f, cur = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        if f == 1:
+            for i in range(bpp, stride): cur[i] = (cur[i] + cur[i - bpp]) & 255
+        elif f == 2:
+            for i in range(stride): cur[i] = (cur[i] + prev[i]) & 255
+        elif f == 3:
+            for i in range(stride): cur[i] = (cur[i] + (((cur[i - bpp] if i >= bpp else 0) + prev[i]) >> 1)) & 255
+        elif f == 4:
+            for i in range(stride):
+                a, b, c = (cur[i - bpp] if i >= bpp else 0), prev[i], (prev[i - bpp] if i >= bpp else 0)
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                cur[i] = (cur[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        elif f != 0:
+            raise ValueError(f"bad PNG filter {f}")
+        rows.append(cur); prev = cur
+    return w, h, bpp, rows, keep
+
+
+def png_encode(w, h, bpp, rows, keep):
+    def chunk(t, b): return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+    raw = b"".join(b"\0" + bytes(r) for r in rows)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2 if bpp == 3 else 6, 0, 0, 0))
+            + b"".join(chunk(t, b) for t, b in keep) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def key_alpha(w, h, bpp, rows, back):
+    """Make the backdrop transparent: flood fill from every border pixel through pixels within TOL of `back`, so only
+    backdrop connected to the (cleared) band goes; enclosed holes and same-coloured subject parts stay opaque.
+    Returns RGBA rows. Hard key, no feathering: antialiased outlines keep a faint backdrop-coloured fringe."""
+    out = []
+    for r in rows:
+        o = bytearray(w * 4)
+        for c in range(3): o[c::4] = r[c::bpp]
+        o[3::4] = b"\xff" * w
+        out.append(o)
+    near = lambda o, x: all(abs(o[x * 4 + c] - back[c]) <= TOL for c in range(3))
+    stack = [(x, y) for x in range(w) for y in (0, h - 1)] + [(x, y) for y in range(h) for x in (0, w - 1)]
+    while stack:
+        x, y = stack.pop()
+        if 0 <= x < w and 0 <= y < h and out[y][x * 4 + 3] and near(out[y], x):
+            out[y][x * 4 + 3] = 0
+            stack += ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))
+    return out
+
+
+def clear_edges(png, pct, alpha=False):
+    """Measure the border band of a rendered PNG against its own backdrop (the per-channel median of the band: the VAE
+    shifts a saturated --bg by tens of levels, so the asked-for colour is not what a clean band decodes to), paint the
+    whole band with that backdrop, and report what was content. Returns (png bytes, backdrop (r, g, b), clipped pixels per
+    side {left, top, right, bottom}, band pixel count). With alpha the PNG is RGBA with the backdrop keyed out."""
+    w, h, bpp, rows, keep = png_decode(png)
+    mx, my = margin_px(pct, w, h)
+    spans = [(y, 0, w) if y < my or y >= h - my else None for y in range(h)]
+    sample = [[], [], []]
+    for y in range(0, h, 3):
+        for x0, x1 in ([(0, w)] if spans[y] else [(0, mx), (w - mx, w)]):
+            for x in range(x0, x1, 3):
+                for c in range(3): sample[c].append(rows[y][x * bpp + c])
+    back = tuple(sorted(v)[len(v) // 2] for v in sample)
+    want = bytes(back + ((255,) if bpp == 4 else ()))
+    clip = dict.fromkeys(("left", "top", "right", "bottom"), 0)
+
+    def dirty(row, x0, x1):
+        n = 0
+        for x in range(x0, x1):
+            o = x * bpp
+            if abs(row[o] - back[0]) > TOL or abs(row[o + 1] - back[1]) > TOL or abs(row[o + 2] - back[2]) > TOL: n += 1
+        return n
+    for y in range(h):
+        row, edge = rows[y], "top" if y < my else "bottom" if y >= h - my else None
+        if edge:  # whole row is band; the corners belong to top/bottom
+            clip[edge] += dirty(row, 0, w)
+        else:
+            clip["left"] += dirty(row, 0, mx); clip["right"] += dirty(row, w - mx, w)
+        for x0, x1 in ((0, w),) if edge else ((0, mx), (w - mx, w)):
+            row[x0 * bpp:x1 * bpp] = want * (x1 - x0)
+    band = w * h - (w - 2 * mx) * (h - 2 * my)
+    if alpha:
+        rows, bpp = key_alpha(w, h, bpp, rows, back), 4
+    return png_encode(w, h, bpp, rows, keep), back, clip, band
+
+
 def render(g, timeout):
     try:
         r = json.loads(call("POST", "/prompt", {"prompt": g, "client_id": "raven-image"}))
@@ -164,6 +293,12 @@ def main():
     ap.add_argument("--vision", action="store_true",
                     help="with --ref: also feed the first 3 refs to the text encoder (TextEncodeQwenImageEditPlus, no vae)")
     ap.add_argument("--graph", help="graphs/<name>.json (default flux3-klein, or flux3-klein-edit with --ref)")
+    ap.add_argument("--margin", type=float, metavar="PCT",
+                    help="keep a PCT%% border band of --bg on every side (rounded up to 16 px): the sampler is pinned to it, "
+                    "then the band is measured and repainted; exit 65 if more than --max-clip %% of it had content")
+    ap.add_argument("--bg", default="ffffff", metavar="RRGGBB", help="backdrop colour for --margin (the prompt must ask for the same one)")
+    ap.add_argument("--alpha", action="store_true", help="--margin: key the backdrop connected to the band to transparent (RGBA output)")
+    ap.add_argument("--max-clip", type=float, default=0.5, metavar="PCT", help="--margin: largest %% of the band that may need clearing (default 0.5)")
     ap.add_argument("--no-enhance", action="store_true", help="send the prompt as the caption, skip the upsampler")
     ap.add_argument("--timeout", type=int, default=900, help="seconds to wait per image")
     ap.add_argument("--keep-loaded", action="store_true", help="skip POST /free at the end")
@@ -172,24 +307,48 @@ def main():
         ap.error("--vision needs at least one --ref")
     if a.graph and (a.graph == "flux3-klein-edit") != bool(a.ref):
         ap.error("--ref and graph flux3-klein-edit go together (the edit graph needs refs, other graphs cannot take them)")
+    if a.margin is not None and not 0 < a.margin <= 40:
+        ap.error("--margin is a percentage above 0 and at most 40")
+    if a.alpha and not a.margin:
+        ap.error("--alpha needs --margin")
+    if not re.fullmatch(r"#?[0-9a-fA-F]{6}", a.bg):
+        ap.error("--bg is six hex digits, RRGGBB")
+    bg = int(a.bg.lstrip("#"), 16)
     a.graph = a.graph or ("flux3-klein-edit" if a.ref else "flux3-klein")
     ref_data = [load_ref(r) for r in a.ref]  # everything refusable is refused before the first request
     w, h = (int(v) for v in a.size.lower().split("x"))
     seed0 = a.seed if a.seed is not None else random.randrange(2 ** 48)
     root, ext = os.path.splitext(a.out)
+    dirty = 0
     try:
         call("GET", "/system_stats", timeout=5)
         refs = [upload(r, d) for r, d in zip(a.ref, ref_data)]
         for i in range(a.n):
             seed = seed0 + i
             t = time.time()
-            png = render(build(a.graph, a.prompt, w, h, seed, not a.no_enhance, refs, a.vision), a.timeout)
+            g = build(a.graph, a.prompt, w, h, seed, not a.no_enhance, refs, a.vision)
+            if a.margin:
+                pin_edges(g, w, h, a.margin, bg)
+            png = render(g, a.timeout)
+            note = ""
+            if a.margin:
+                try:
+                    png, back, clip, band = clear_edges(png, a.margin, a.alpha)
+                except (ValueError, zlib.error, struct.error) as e:
+                    sys.exit(f"raven-image: --margin: cannot read the render as a PNG ({e}); nothing written")
+                pct = 100 * sum(clip.values()) / band
+                note = "  margin %s%%: backdrop #%02x%02x%02x, cleared %d of %d band px (%.2f%%; %s)" % (
+                    a.margin, *back, sum(clip.values()), band, pct, " ".join(f"{k} {v}" for k, v in clip.items()))
+                if pct > a.max_clip:
+                    dirty += 1; note += f"  DIRTY: over --max-clip {a.max_clip}%"
             path = a.out if a.n == 1 else f"{root}-{i + 1}{ext}"
             with open(path, "wb") as f:
                 f.write(png)
-            print(f"{path}  seed={seed}  {w}x{h}  {time.time() - t:.0f}s", flush=True)
+            print(f"{path}  seed={seed}  {w}x{h}  {time.time() - t:.0f}s{note}", flush=True)
         if not a.keep_loaded:
             print("freed Raven's VRAM" if free_if_idle() else "queue not empty, left models loaded")
+        if dirty:
+            sys.exit(EX_DIRTY)
     except Busy as e:
         print(f"raven-image: Raven may be busy or off ({BASE}: {e}). Not retrying; try again later. "
               "Most likely cause after a Raven reboot: the lock screen (the ComfyUI task needs someone logged in on Raven's desktop). "

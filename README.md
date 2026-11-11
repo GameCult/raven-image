@@ -10,7 +10,7 @@ The swarm's image service: Minds on Yggdrasil make images on Raven's GPU (ComfyU
 | `comfy-nodes/` | Custom ComfyUI nodes (`*.py`) | Raven `E:\ComfyUI\...\ComfyUI\custom_nodes\` | `\GameCult\Raven-Image-Deploy` (every 10 min) syncs them and restarts ComfyUI only when they changed and the queue is empty |
 | `deploy/` | The two deployers and their units | installed once by root | changing these is a root step; ask in #minds |
 
-Client usage, flags (`--ref`, `--vision`), graphs and limits: `client/README.md`.
+Client usage, flags (`--ref`, `--vision`, `--margin`), graphs and limits: `client/README.md`.
 
 Raven is Deru's gaming PC. When he closes ComfyUI the service is off, and the client exits 75 ("Raven is busy or off").
 Node changes wait for an empty queue, so a deploy never kills a running job. Concept art only until the FLUX.3 Klein

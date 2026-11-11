@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 tool = os.path.join(root, "client", "raven-image")
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
-seen = {"uploads": [], "prompts": []}
+seen = {"uploads": [], "prompts": [], "view": PNG}
 
 
 class H(BaseHTTPRequestHandler):
@@ -19,7 +19,7 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/history/"):
             self.send(json.dumps({self.path[9:]: {"status": {"completed": True}, "outputs": {"9": {"images": [
                 {"filename": "x.png", "subfolder": "", "type": "temp"}]}}}}).encode())
-        elif self.path.startswith("/view"): self.send(PNG, "image/png")
+        elif self.path.startswith("/view"): self.send(seen["view"], "image/png")
         elif self.path == "/queue": self.send(b'{"queue_running":[],"queue_pending":[]}')
         else: self.send(b"{}")
     def do_POST(self):
@@ -176,6 +176,84 @@ for nm in ('a"b\r\nX-Evil: 1\\c.png', "pass wd;$x.png", "é.png"):
 # unreachable Raven: 75 with the hedged message
 p, _ = run("cap", url="http://127.0.0.1:1")
 check(p.returncode == 75 and "may be busy or off" in p.stderr and "lock screen" in p.stderr, "unreachable: exit 75, hedged message names lock screen")
+
+# --margin: the pin is in the graph, the band is measured and repainted, a dirty band is loud
+import importlib.machinery, importlib.util, struct, zlib
+mod2 = importlib.util.module_from_spec(importlib.util.spec_from_loader("ri2", importlib.machinery.SourceFileLoader("ri2", tool)))
+mod2.__spec__.loader.exec_module(mod2)
+def mkpng(w, h, px, bpp=3, filt=0):
+    """px(x, y) -> tuple of bpp bytes. filt 0..4 applies that PNG filter to every row (the decoder must undo all five)."""
+    rows = [bytes(v for x in range(w) for v in px(x, y)) for y in range(h)]
+    raw, prev = b"", bytes(w * bpp)
+    for r in rows:
+        f = bytearray()
+        for i in range(w * bpp):
+            a, b, c = (r[i - bpp] if i >= bpp else 0), prev[i], (prev[i - bpp] if i >= bpp else 0)
+            pr = (0, a, b, (a + b) >> 1, (lambda pa, pb, pc: a if pa <= pb and pa <= pc else b if pb <= pc else c)(abs(b - c), abs(a - c), abs(a + b - 2 * c)))[filt]
+            f.append((r[i] - pr) & 255)
+        raw += bytes([filt]) + bytes(f); prev = r
+    ck = lambda t, b: struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+    return (b"\x89PNG\r\n\x1a\n" + ck(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2 if bpp == 3 else 6, 0, 0, 0))
+            + ck(b"tEXt", b"prompt\0keepme") + ck(b"IDAT", zlib.compress(raw)) + ck(b"IEND", b""))
+BG = (30, 200, 90)
+# codec: every filter type round-trips, ancillary chunks survive
+for f in range(5):
+    for bpp in (3, 4):
+        pic = lambda x, y, bpp=bpp: ((x * 7 + y * 3) & 255, (x * y) & 255, (x ^ y) & 255) + ((200,) if bpp == 4 else ())
+        w_, h_, b_, rows_, keep_ = mod2.png_decode(mkpng(37, 23, pic, bpp, f))
+        check((w_, h_, b_) == (37, 23, bpp) and all(bytes(rows_[y][x * bpp:(x + 1) * bpp]) == bytes(pic(x, y)) for y in range(23) for x in range(37))
+              and keep_ == [(b"tEXt", b"prompt\0keepme")], f"png codec: filter {f}, {bpp} bytes/px")
+        check(mod2.png_decode(mod2.png_encode(w_, h_, b_, rows_, keep_))[3] == rows_, f"png codec: encode round-trips (filter {f}, {bpp})")
+for bad in (b"nope", mkpng(8, 8, lambda x, y: BG)[:40]):
+    try: mod2.png_decode(bad); check(False, "png_decode refuses garbage")
+    except (ValueError, zlib.error, struct.error): check(True, "")
+# margin_px: pct of each axis, up to the 16 px latent grid
+check(mod2.margin_px(6, 1024, 1024) == (64, 64) and mod2.margin_px(5, 1536, 1024) == (80, 64) and mod2.margin_px(0.1, 1024, 1024) == (16, 16),
+      "margin_px: 16 px steps per axis")
+# the pin graph: flat-bg latent, noise mask 0 on the band and 1 inside, sampler starts from it
+for extra, base in (([], "flux3-klein.json"), (["--ref", refs[0]], "flux3-klein-edit.json")):
+    p, g = run(*extra, "--margin", "5", "--bg", "#12fa5f", "--size", "1536x1024", "--no-enhance", "cap")
+    check(g is not None and "6" not in g and g["7"]["inputs"]["latent_image"] == ["35", 0], f"margin {base}: sampler starts from the masked latent, empty latent gone")
+    if g:
+        check(g["30"]["inputs"] == {"width": 1536, "height": 1024, "batch_size": 1, "color": 0x12fa5f}, f"margin {base}: flat bg image at full size")
+        check(g["31"] == {"class_type": "VAEEncode", "inputs": {"pixels": ["30", 0], "vae": ["3", 0]}}, f"margin {base}: bg encoded with the graph's vae")
+        check(g["32"]["inputs"] == {"value": 0.0, "width": 1536, "height": 1024} and g["33"]["inputs"] == {"value": 1.0, "width": 1536 - 160, "height": 1024 - 128},
+              f"margin {base}: mask 0 outside, 1 inside by 80x64 px")
+        check(g["34"]["inputs"]["x"] == 80 and g["34"]["inputs"]["y"] == 64 and g["34"]["inputs"]["operation"] == "add"
+              and g["34"]["inputs"]["destination"] == ["32", 0] and g["34"]["inputs"]["source"] == ["33", 0], f"margin {base}: interior composited at the margin offset")
+        check(g["35"]["inputs"] == {"samples": ["31", 0], "mask": ["34", 0]} and g["7"]["inputs"]["denoise"] == 1, f"margin {base}: noise mask on the encoded bg, denoise stays 1")
+p, g = run("--no-enhance", "cap")
+check(g is not None and "6" in g and "35" not in g, "no --margin: graph unchanged")
+for args, needle in ((["--margin", "0"], "--margin is"), (["--margin", "41"], "--margin is"), (["--margin", "5", "--bg", "green"], "--bg is"), (["--alpha"], "--alpha needs --margin")):
+    refused([*args, "cap"], needle, " ".join(args))
+# the render is measured: clean band exits 0 and is exact, content in the band is cleared and exits 65, alpha keys only connected backdrop
+W = 160  # 6% -> 16 px band
+def scene(x, y, hole=False):
+    if x < 6 and y < 6 or (hole and 80 <= x < 90 and 80 <= y < 90): return (250, 20, 20)  # corner speck in the band; an enclosed hole is separate below
+    return BG if not (50 <= x < 110 and 50 <= y < 110) else (250, 20, 20)
+seen["view"] = mkpng(W, W, lambda x, y: (BG[0] + (x + y) % 3, BG[1], BG[2]) if not (50 <= x < 110 and 50 <= y < 110) else (250, 20, 20))
+p, g = run("--margin", "6", "--size", "160x160", "--no-enhance", "cap")
+out = open(os.path.join(tmp, "o.png"), "rb").read()
+check(p.returncode == 0 and "cleared 0 of" in p.stdout and "backdrop #1ec85a" in p.stdout, f"clean band: exit 0, nothing cleared, backdrop reported ({p.stdout.strip()[-140:]})")
+r_ = mod2.png_decode(out)[3]
+check(all(bytes(r_[y][x * 3:x * 3 + 3]) == bytes(BG) for y in range(W) for x in range(W) if x < 16 or y < 16 or x >= W - 16 or y >= W - 16), "clean band: repainted exactly to the backdrop")
+check(bytes(r_[80][80 * 3:80 * 3 + 3]) == bytes((250, 20, 20)), "clean band: interior untouched")
+seen["view"] = mkpng(W, W, lambda x, y: (250, 20, 20) if (x < 12 and 30 <= y < 130) or (50 <= x < 110 and 50 <= y < 110) else BG)  # a stub entering the left band
+p, g = run("--margin", "6", "--size", "160x160", "--no-enhance", "cap")
+check(p.returncode == 65 and "DIRTY" in p.stdout and "left %d" % (12 * 100) in p.stdout and "top 0" in p.stdout, f"dirty band: exit 65 naming the side ({p.returncode} {p.stdout.strip()[-160:]})")
+r_ = mod2.png_decode(open(os.path.join(tmp, "o.png"), "rb").read())[3]
+check(all(bytes(r_[y][x * 3:x * 3 + 3]) == bytes(BG) for y in range(W) for x in range(12)), "dirty band: file is written and the stub cleared")
+p, g = run("--margin", "6", "--max-clip", "50", "--size", "160x160", "--no-enhance", "cap")
+check(p.returncode == 0, "--max-clip raises the tolerance")
+holes = lambda x, y: (250, 20, 20) if (50 <= x < 110 and 50 <= y < 110 and not (70 <= x < 90 and 70 <= y < 90)) else BG  # ring around an enclosed backdrop hole
+seen["view"] = mkpng(W, W, holes)
+p, g = run("--margin", "6", "--alpha", "--size", "160x160", "--no-enhance", "cap")
+w_, h_, b_, r_, k_ = mod2.png_decode(open(os.path.join(tmp, "o.png"), "rb").read())
+check(p.returncode == 0 and b_ == 4 and r_[0][3] == 0 and r_[30][3 + 4 * 40] == 0 and r_[60][4 * 60 + 3] == 255, "--alpha: RGBA, outside keyed out, subject opaque")
+check(r_[80][4 * 80 + 3] == 255, "--alpha: enclosed backdrop hole stays opaque (connected backdrop only)")
+seen["view"] = PNG
+p, g = run("--margin", "6", "--no-enhance", "cap")
+check(p.returncode != 0 and "cannot read the render" in p.stderr and "Traceback" not in p.stderr, "undecodable render: clean error, no traceback")
 
 srv.shutdown()
 print(f"{count[0] - len(fails)}/{count[0]} checks passed")
