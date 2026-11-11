@@ -80,7 +80,7 @@ the subject also contains (green in a green-eyed character) is untouched except 
 a rectangle, so the pin cannot ask for a vignette or a round sticker. A subject cannot be asked to stay off the seam: only
 the exit code tells you it did not.
 
-Offline test (fake ComfyUI on 127.0.0.1, 158 checks): `python3 tests/test-raven-image.py`.
+Offline test (fake ComfyUI on 127.0.0.1, 159 checks): `python3 tests/test-raven-image.py`.
 
 ## What it does
 

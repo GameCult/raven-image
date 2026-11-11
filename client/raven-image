@@ -160,6 +160,8 @@ def png_decode(data):
     if hdr is None or not idat:
         raise ValueError("no IHDR or no image data")
     w, h, depth, ctype, _, _, interlace = hdr
+    if not 0 < w * h <= 2 ** 26:  # before any allocation sized by the header: 2**32-1 squared would ask for 12 GB and overflow ssize_t
+        raise ValueError(f"image size {w}x{h} is out of range")
     if depth != 8 or ctype not in (2, 6) or interlace:
         raise ValueError(f"only 8-bit non-interlaced RGB/RGBA is handled (got depth {depth}, colour type {ctype}, interlace {interlace})")
     bpp = 3 if ctype == 2 else 4

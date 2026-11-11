@@ -307,12 +307,13 @@ def blob(w, h, depth=8, ctype=2, idat=None, il=0):
             + ck(b"IDAT", idat if idat is not None else zlib.compress(b"\0" * (h * (w * 3 + 1)) if w * h < 10 ** 7 else b"")) + ck(b"IEND", b""))
 good = mkpng(8, 8, lambda x, y: BG)
 bad = bytearray(good); bad[40] ^= 1
-for data, what in ((bytes(bad), "flipped byte (CRC)"), (blob(2 ** 21, 2 ** 21), "a header that promises far more than the data"), (blob(8, 8, idat=zlib.compress(b"\0" * (8 * 25 - 1))), "image data shorter than the header says"),
+for data, what in ((bytes(bad), "flipped byte (CRC)"), (blob(2 ** 21, 2 ** 21), "a header that promises far more than the data"), (blob(2 ** 32 - 1, 2 ** 32 - 1), "a 2**32-1 square header (must refuse before allocating)"), (blob(8, 8, idat=zlib.compress(b"\0" * (8 * 25 - 1))), "image data shorter than the header says"),
                    (blob(8, 8, idat=zlib.compress(b"\0" * (8 * 25 + 500))), "image data longer than the header says"), (blob(8, 8, depth=16), "16-bit"),
                    (blob(8, 8, ctype=3), "palette"), (blob(8, 8, il=1), "interlaced"), (good[:-20], "truncated"),
                    (good[:8] + struct.pack(">I", 10 ** 6) + good[12:], "chunk length past the end")):
     try: mod2.png_decode(data); check(False, f"png_decode refuses {what}")
     except (ValueError, zlib.error, struct.error): check(True, "")
+    except BaseException as e: check(False, f"png_decode refuses {what} cleanly, got {type(e).__name__}")
 # size and interior validation, before any request
 refused(["--size", "foo", "cap"], "--size is WxH", "--size foo")
 refused(["--size", "1000x1024", "cap"], "multiples of 16", "--size not on the grid")
