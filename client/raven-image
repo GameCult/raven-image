@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""raven-image: text-to-image on Raven's ComfyUI (Yggdrasil-only, http://10.77.0.4:8190).
+
+Talks to ComfyUI's own API: POST /prompt, poll GET /history/<id>, GET /view,
+POST /free when the queue is empty. No retry loop: an unreachable Raven exits 75
+with "Raven may be busy or off". See README.md next to this file.
+"""
+import argparse, json, math, os, random, stat, sys, time, urllib.error, urllib.parse, urllib.request
+
+BASE = os.environ.get("RAVEN_URL", "http://10.77.0.4:8190")
+EX_BUSY = 75  # EX_TEMPFAIL: no answer from Raven (off, busy, a read timeout mid-render, or a lock screen after a reboot); try again later, by hand
+MAX_REF = 20 * 2 ** 20  # bytes; refs persist in Raven's input folder, so cap what we put there
+MAGIC = ((b"\x89PNG\r\n\x1a\n", None), (b"\xff\xd8\xff", None), (b"RIFF", b"WEBP"))  # png, jpeg, webp (bytes 8-12)
+
+
+class Busy(Exception):
+    pass
+
+
+def graph_dir():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for d in (os.environ.get("RAVEN_GRAPHS"), os.path.join(here, "graphs")):
+        if d and os.path.isdir(d):
+            return d
+    sys.exit("raven-image: no graphs/ directory (set RAVEN_GRAPHS)")
+
+
+def call(method, path, body=None, timeout=30):
+    req = urllib.request.Request(BASE + path, method=method,
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError:
+        raise
+    except (urllib.error.URLError, OSError) as e:  # refused, timed out, unroutable
+        raise Busy(str(e))
+
+
+def load_ref(arg):
+    """Validate a --ref before anything is uploaded; returns the image bytes. Errors name the argument as typed."""
+    p = os.path.realpath(arg)
+    # O_NONBLOCK so a FIFO swapped in after any earlier check cannot hang open(); judge the opened descriptor, not the path.
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        sys.exit(f"raven-image: --ref {arg!r}: no such file")
+    except OSError as e:
+        sys.exit(f"raven-image: --ref {arg!r}: {e.strerror}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            sys.exit(f"raven-image: --ref {arg!r}: not a regular file")
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            data = f.read(MAX_REF + 1)
+    except OSError as e:
+        sys.exit(f"raven-image: --ref {arg!r}: {e.strerror}")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(data) > MAX_REF:
+        sys.exit(f"raven-image: --ref {arg!r}: larger than {MAX_REF // 2 ** 20} MiB")
+    if not any(data.startswith(m) and (t is None or data[8:12] == t) for m, t in MAGIC):
+        sys.exit(f"raven-image: --ref {arg!r}: not a png, jpeg or webp image")
+    return data
+
+
+def safe_name(arg):
+    base = os.path.basename(arg) or "ref"
+    return "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in base)[-80:]
+
+
+def upload(arg, data):
+    """POST /upload/image (multipart); returns the name ComfyUI stored it under."""
+    name = "raven-image-" + os.urandom(4).hex() + "-" + safe_name(arg)
+    b = "----ravenimage" + os.urandom(8).hex()
+    parts = [("--%s\r\nContent-Disposition: form-data; name=\"image\"; filename=\"%s\"\r\n"
+              "Content-Type: application/octet-stream\r\n\r\n" % (b, name)).encode(), data,
+             ("\r\n--%s\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\ntrue\r\n--%s--\r\n" % (b, b)).encode()]
+    req = urllib.request.Request(BASE + "/upload/image", method="POST", data=b"".join(parts),
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + b})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read())["name"]
+    except urllib.error.HTTPError as e:
+        sys.exit(f"raven-image: Raven rejected the reference upload: {e.read().decode()[:800]}")
+    except (urllib.error.URLError, OSError) as e:
+        raise Busy(str(e))
+
+
+def build(name, text, w, h, seed, enhance, refs=(), vision=False):
+    with open(os.path.join(graph_dir(), name + ".json")) as f:
+        g = json.load(f)
+    g["6"]["inputs"].update(width=w, height=h)
+    g["7"]["inputs"]["seed"] = seed
+    for i, r in enumerate(refs):  # node 12 is ref 0; the rest join the reference latent and the upsampler's view
+        k = "12" if i == 0 else f"2{i}"
+        g[k] = {"class_type": "LoadImage", "inputs": {"image": r}}
+        g["13"]["inputs"][f"images.image{i}"] = [k, 0]
+        g["14"]["inputs"][f"images.image{i}"] = [k, 0]
+    if refs and not enhance:
+        del g["14"]
+    # node 4 (the text encoder) is decided once, here: its prompt is the upsampler's output (a link) or the caption itself
+    prompt = ["11", 0] if enhance else text
+    if vision:  # the encoder sees the refs too (vision tower); no vae, so ReferenceMultiLatent stays the only latent path
+        enc = {"clip": ["2", 0], "prompt": prompt}
+        enc.update({f"image{i + 1}": [("12" if i == 0 else f"2{i}"), 0] for i in range(min(len(refs), 3))})
+        g["4"] = {"class_type": "TextEncodeQwenImageEditPlus", "inputs": enc}
+    else:
+        g["4"]["inputs"]["text"] = prompt
+    if enhance:
+        d = math.gcd(w, h)
+        g["11"]["inputs"]["prompt"] = text if refs else f"TARGET CANVAS: {w // d}:{h // d}\n{text}"
+    else:
+        for k in ("10", "11"):
+            del g[k]
+    return g
+
+
+def render(g, timeout):
+    try:
+        r = json.loads(call("POST", "/prompt", {"prompt": g, "client_id": "raven-image"}))
+    except urllib.error.HTTPError as e:
+        sys.exit(f"raven-image: Raven rejected the graph: {e.read().decode()[:800]}")
+    pid = r["prompt_id"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        h = json.loads(call("GET", f"/history/{pid}")).get(pid)
+        if not h:
+            continue
+        st = h.get("status", {})
+        if st.get("status_str") == "error":
+            msgs = [m for m in st.get("messages", []) if m[0] == "execution_error"]
+            sys.exit(f"raven-image: render failed: {json.dumps(msgs[-1][1] if msgs else st)[:800]}")
+        for out in h.get("outputs", {}).values():
+            for im in out.get("images", []):
+                q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im["subfolder"], "type": im["type"]})
+                return call("GET", "/view?" + q, timeout=120)
+        if st.get("completed"):
+            sys.exit("raven-image: render completed with no image")
+    sys.exit(f"raven-image: no image after {timeout}s (prompt {pid} may still be running on Raven)")
+
+
+def free_if_idle():
+    q = json.loads(call("GET", "/queue"))
+    if not q.get("queue_running") and not q.get("queue_pending"):
+        call("POST", "/free", {"unload_models": True, "free_memory": True})
+        return True
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("prompt", help="short prompt; the upsampler expands it unless --no-enhance")
+    ap.add_argument("-o", "--out", default="raven.png", help="output file; with -n>1 gets -1, -2... before the extension")
+    ap.add_argument("-n", type=int, default=1, help="images to render, one after another")
+    ap.add_argument("--size", default="1536x1024", help="WxH, multiples of 16")
+    ap.add_argument("--seed", type=int, help="seed of the first image (default random); image i uses seed+i")
+    ap.add_argument("--ref", metavar="IMAGE", action="append", default=[],
+                    help="reference image, repeatable; runs graphs/flux3-klein-edit. The prompt cites them as "
+                    "<ref_image_0>, <ref_image_1>... in order and is a full caption of the result with the edit folded in")
+    ap.add_argument("--vision", action="store_true",
+                    help="with --ref: also feed the first 3 refs to the text encoder (TextEncodeQwenImageEditPlus, no vae)")
+    ap.add_argument("--graph", help="graphs/<name>.json (default flux3-klein, or flux3-klein-edit with --ref)")
+    ap.add_argument("--no-enhance", action="store_true", help="send the prompt as the caption, skip the upsampler")
+    ap.add_argument("--timeout", type=int, default=900, help="seconds to wait per image")
+    ap.add_argument("--keep-loaded", action="store_true", help="skip POST /free at the end")
+    a = ap.parse_args()
+    if a.vision and not a.ref:
+        ap.error("--vision needs at least one --ref")
+    if a.graph and (a.graph == "flux3-klein-edit") != bool(a.ref):
+        ap.error("--ref and graph flux3-klein-edit go together (the edit graph needs refs, other graphs cannot take them)")
+    a.graph = a.graph or ("flux3-klein-edit" if a.ref else "flux3-klein")
+    ref_data = [load_ref(r) for r in a.ref]  # everything refusable is refused before the first request
+    w, h = (int(v) for v in a.size.lower().split("x"))
+    seed0 = a.seed if a.seed is not None else random.randrange(2 ** 48)
+    root, ext = os.path.splitext(a.out)
+    try:
+        call("GET", "/system_stats", timeout=5)
+        refs = [upload(r, d) for r, d in zip(a.ref, ref_data)]
+        for i in range(a.n):
+            seed = seed0 + i
+            t = time.time()
+            png = render(build(a.graph, a.prompt, w, h, seed, not a.no_enhance, refs, a.vision), a.timeout)
+            path = a.out if a.n == 1 else f"{root}-{i + 1}{ext}"
+            with open(path, "wb") as f:
+                f.write(png)
+            print(f"{path}  seed={seed}  {w}x{h}  {time.time() - t:.0f}s", flush=True)
+        if not a.keep_loaded:
+            print("freed Raven's VRAM" if free_if_idle() else "queue not empty, left models loaded")
+    except Busy as e:
+        print(f"raven-image: Raven may be busy or off ({BASE}: {e}). Not retrying; try again later. "
+              "Most likely cause after a Raven reboot: the lock screen (the ComfyUI task needs someone logged in on Raven's desktop). "
+              "A read timeout mid-render also lands here.", file=sys.stderr)
+        sys.exit(EX_BUSY)
+
+
+if __name__ == "__main__":
+    main()

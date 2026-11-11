@@ -1,0 +1,15 @@
+[Unit]
+Description=Install the raven-image client from GameCult/raven-image main
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/install-raven-image
+ProtectSystem=strict
+ReadWritePaths=/opt/commons/opt /opt/commons/bin
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=256M
+Nice=10
