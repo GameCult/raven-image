@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Offline test of client/raven-image against an in-process fake ComfyUI on 127.0.0.1.
 Asserts on the POSTed /prompt graph and the multipart upload. Needs only python3. Usage: test-raven-image.py [repo-root]"""
-import json, os, subprocess, sys, tempfile, threading
+import hashlib, json, os, re, subprocess, sys, tempfile, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 tool = os.path.join(root, "client", "raven-image")
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+CAPTION = "Full-color photograph, a small private space yacht moored at a dock, soft light."
 seen = {"uploads": [], "prompts": [], "view": PNG}
 
 
@@ -17,8 +18,10 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
         if self.path.startswith("/history/"):
-            self.send(json.dumps({self.path[9:]: {"status": {"completed": True}, "outputs": {"9": {"images": [
-                {"filename": "x.png", "subfolder": "", "type": "temp"}]}}}}).encode())
+            g, outs = seen["prompts"][-1], {}  # like ComfyUI, report only the output nodes the posted graph has
+            if "9" in g: outs["9"] = {"images": [{"filename": "x.png", "subfolder": "", "type": "temp"}]}
+            if "20" in g: outs["20"] = {"text": [CAPTION]}
+            self.send(json.dumps({self.path[9:]: {"status": {"completed": True}, "outputs": outs}}).encode())
         elif self.path.startswith("/view"): self.send(seen["view"], "image/png")
         elif self.path == "/queue": self.send(b'{"queue_running":[],"queue_pending":[]}')
         else: self.send(b"{}")
@@ -323,6 +326,49 @@ refused(["--margin", "5", "--size", "32x512", "cap"], "leaves no room", "margin 
 seen["view"] = mkpng(160, 160, lambda x, y: RED if x < 12 else BG)
 p, g = run("--margin", "6", "--bg", "1ec85a", "-n", "2", "--size", "160x160", "--no-enhance", "cap")
 check(p.returncode == 65 and p.stdout.count("DIRTY") == 2, f"-n 2 both dirty: two reports, exit 65 ({p.returncode})")
+
+# the record beside each image, and --caption-only
+side = os.path.join(tmp, "o.json")
+def has(name): return name in os.listdir(tmp)  # os.path.exists is stubbed earlier in this file
+def record(*args):
+    if has("o.json"): os.remove(side)
+    p, g = run(*args)
+    return p, g, (json.load(open(side, encoding="utf-8")) if has("o.json") else None)
+p, g, rec = record("--seed", "42", "--size", "512x768", "yacht")
+check(p.returncode == 0 and rec is not None and "20" in g, f"sidecar: written beside the image ({p.stderr[-200:]})")
+if rec:
+    check(g["20"] == {"class_type": "PreviewAny", "inputs": {"source": ["11", 0]}}, "sidecar: node 20 is PreviewAny on the upsampler")
+    check(rec["caption"] == CAPTION and rec["prompt"] == "yacht", "sidecar: caption is the upsampler's text, prompt the argument")
+    check(rec["seed"] == 42 and rec["size"] == "512x768" and rec["enhance"] is True, "sidecar: seed, size, enhance")
+    check((rec["steps"], rec["cfg"], rec["sampler"], rec["scheduler"]) == (16, 1, "euler", "simple"), "sidecar: sampler settings")
+    check(rec["graph"] == "flux3-klein" and rec["graph_sha256"] == hashlib.sha256(open(os.path.join(root, "client", "graphs", "flux3-klein.json"), "rb").read()).hexdigest(), "sidecar: graph name and sha256")
+    check(rec["client_sha256"] == hashlib.sha256(open(tool, "rb").read()).hexdigest(), "sidecar: client sha256")
+    check(rec["models"] == {"1": "flux3-image-klein-int8-convrot.safetensors", "2": "qwen3vl_4b_int8_convrot.safetensors",
+                            "3": "flux2-vae.safetensors", "10": "qwen3.5_9b_flux3_prompt_upsampler_w4a8.safetensors"}, "sidecar: models from the loader nodes")
+    check(rec["refs"] == [] and rec["margin"] is None and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", rec["utc"]), "sidecar: no refs, no margin, utc stamp")
+p, g, rec = record("--no-enhance", "--seed", "7", "plain cap")
+check(rec is not None and rec["caption"] == "plain cap" and rec["enhance"] is False and "20" not in g and "10" not in rec["models"], "no-enhance sidecar: caption is the prompt, no node 20")
+p, g, rec = record("--ref", refs[0], "--no-enhance", "cap <ref_image_0>")
+check(rec is not None and rec["refs"] == ["r0.png"] and rec["graph"] == "flux3-klein-edit", "edit sidecar: sanitised ref name, edit graph")
+p, g, rec = record("--ref", refs[0], "--vision", "cap <ref_image_0>")
+check(rec is not None and rec["caption"] == CAPTION and "20" in g, "vision edit sidecar: upsampler caption")
+p, g = run("-n", "2", "--no-enhance", "cap")
+check(has("o-1.json") and has("o-2.json"), "-n 2: one sidecar per image")
+refused(["-o", os.path.join(tmp, "x.json"), "cap"], "must not end in .json", "--out .json")
+for f in ("o.png", "o.json"):
+    if has(f): os.remove(os.path.join(tmp, f))
+p, g = run("--caption-only", "--seed", "3", "yacht")
+check(p.returncode == 0 and p.stdout.strip() == CAPTION and p.stderr == "", f"caption-only: stdout is the caption ({p.stdout!r} {p.stderr[-200:]})")
+check(g is not None and sorted(g) == ["10", "11", "20"], f"caption-only: graph is nodes 10, 11, 20 only ({sorted(g or [])})")
+check(g is not None and g["11"]["inputs"]["prompt"] == "TARGET CANVAS: 3:2\nyacht", "caption-only: upsampler prompt as a render would send it")
+check(not has("o.png") and not has("o.json"), "caption-only: no file written")
+for args, w in ((["--no-enhance"], "--no-enhance"), (["--ref", refs[0]], "--ref"), (["--margin", "5"], "--margin")):
+    refused(["--caption-only", *args, "cap"], "cannot be combined", "caption-only with " + w)
+
+# a margin render records its margin and backdrop beside the cleared image
+seen["view"] = mkpng(160, 160, lambda x, y: BG)
+p, g, rec = record("--margin", "6", "--bg", "1ec85a", "--size", "160x160", "cap")
+check(p.returncode == 0 and rec is not None and rec["margin"] == 6 and rec["bg"] == "1ec85a", f"margin sidecar: margin and bg ({p.stderr[-200:]})")
 
 srv.shutdown()
 print(f"{count[0] - len(fails)}/{count[0]} checks passed")
