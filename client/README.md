@@ -17,6 +17,22 @@ raven-image "a full caption" --no-enhance -o out.png                  # skip the
 Prints one line per image (`path seed size seconds`). Defaults: 1536x1024, random
 seed, 900 s wait per image.
 
+**Record.** Next to every image the client writes `<image>.json` (`out.png` gets `out.json`; `-n 4` gets one per image), in
+every mode: client and graph sha256, model file names, size, seed, steps, cfg, sampler, scheduler, `enhance`, `prompt` (as
+typed), `caption` (the exact text the encoder saw), `vision` (whether `--vision` fed the refs to the encoder), `encoder` (the node id and class
+that consumed the prompt: `CLIPTextEncode` or `TextEncodeQwenImageEditPlus`), `refs` (each as `{name, sha256}` of its content), `margin`, `bg`, seconds, UTC time. With the upsampler on
+the caption is read from ComfyUI's `PreviewAny` output (node 20, on the upsampler's output), and a render whose history lacks it
+fails without writing; with `--no-enhance` the caption is the prompt. `--out` may not end in `.json`.
+
+```
+raven-image --caption-only "small private space yacht" --size 1536x1024   # prints the caption, renders nothing, writes nothing
+```
+
+`--caption-only` runs only nodes 10, 11 and 20 (about 9 s, no image) and prints what the upsampler made of the prompt, so a
+person or a model can read it before Raven spends a render. It matters: that prompt came back as a boat on open water, an
+attractor visible only in the caption. It refuses `--no-enhance`, `--ref` and `--margin`; exit codes are as for a render.
+Images stay `PreviewImage`; the client never saves into Raven's output history.
+
 ```
 raven-image --ref sheet.png "Using the character from <ref_image_0>, show her seated at a desk typing, ..." --size 1024x1024 -o out.png
 raven-image --ref a.png --ref b.png --vision "<ref_image_0> ... <ref_image_1> ..." -o out.png

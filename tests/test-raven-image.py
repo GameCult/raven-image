@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Offline test of client/raven-image against an in-process fake ComfyUI on 127.0.0.1.
 Asserts on the POSTed /prompt graph and the multipart upload. Needs only python3. Usage: test-raven-image.py [repo-root]"""
-import json, os, subprocess, sys, tempfile, threading
+import hashlib, json, os, re, subprocess, sys, tempfile, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 tool = os.path.join(root, "client", "raven-image")
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
-seen = {"uploads": [], "prompts": [], "view": PNG}
+CAPTION = "Full-color photograph, a small private space yacht moored at a dock, soft light."
+seen = {"uploads": [], "prompts": [], "view": PNG, "drop20": False, "free": 0}
 
 
 class H(BaseHTTPRequestHandler):
@@ -17,8 +18,10 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
         if self.path.startswith("/history/"):
-            self.send(json.dumps({self.path[9:]: {"status": {"completed": True}, "outputs": {"9": {"images": [
-                {"filename": "x.png", "subfolder": "", "type": "temp"}]}}}}).encode())
+            g, outs = seen["prompts"][-1], {}  # like ComfyUI, report only the output nodes the posted graph has
+            if "9" in g: outs["9"] = {"images": [{"filename": "x.png", "subfolder": "", "type": "temp"}]}
+            if "20" in g and not seen["drop20"]: outs["20"] = {"text": [CAPTION]}
+            self.send(json.dumps({self.path[9:]: {"status": {"completed": True}, "outputs": outs}}).encode())
         elif self.path.startswith("/view"): self.send(seen["view"], "image/png")
         elif self.path == "/queue": self.send(b'{"queue_running":[],"queue_pending":[]}')
         else: self.send(b"{}")
@@ -26,6 +29,7 @@ class H(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         if self.path == "/upload/image":
             seen["uploads"].append(body); self.send(json.dumps({"name": "stored%d.png" % len(seen["uploads"])}).encode())
+        elif self.path == "/free": seen["free"] += 1; self.send(b"{}")
         elif self.path == "/prompt":
             seen["prompts"].append(json.loads(body)["prompt"]); self.send(b'{"prompt_id":"p1"}')
         else: self.send(b"{}")
@@ -45,11 +49,13 @@ def check(cond, what):
         fails.append(what); print("FAIL:", what)
 
 
-def run(*args, url=url):
-    seen["uploads"].clear(); seen["prompts"].clear()
+def run(*args, url=url, keep=True):
+    seen["uploads"].clear(); seen["prompts"].clear(); seen["free"] = 0
     env = dict(os.environ, RAVEN_URL=url)
-    p = subprocess.run([sys.executable, "-I", tool, "--keep-loaded", "-o", os.path.join(tmp, "o.png"), *args],
+    p = subprocess.run([sys.executable, "-I", tool, *(["--keep-loaded"] if keep else []), "-o", os.path.join(tmp, "o.png"), *args],
                        capture_output=True, text=True, env=env, timeout=120)
+    for g in seen["prompts"]:  # images stay PreviewImage and never reach Deru's playground history
+        check(all(n["class_type"] != "SaveImage" for n in g.values()), f"no SaveImage in the posted graph ({' '.join(args)[:60]})")
     return p, (seen["prompts"][0] if seen["prompts"] else None)
 
 
@@ -323,6 +329,63 @@ refused(["--margin", "5", "--size", "32x512", "cap"], "leaves no room", "margin 
 seen["view"] = mkpng(160, 160, lambda x, y: RED if x < 12 else BG)
 p, g = run("--margin", "6", "--bg", "1ec85a", "-n", "2", "--size", "160x160", "--no-enhance", "cap")
 check(p.returncode == 65 and p.stdout.count("DIRTY") == 2, f"-n 2 both dirty: two reports, exit 65 ({p.returncode})")
+
+# the record beside each image, and --caption-only
+side = os.path.join(tmp, "o.json")
+def has(name): return name in os.listdir(tmp)  # os.path.exists is stubbed earlier in this file
+def record(*args):
+    if has("o.json"): os.remove(side)
+    p, g = run(*args)
+    return p, g, (json.load(open(side, encoding="utf-8")) if has("o.json") else None)
+p, g, rec = record("--seed", "42", "--size", "512x768", "yacht")
+check(p.returncode == 0 and rec is not None and "20" in g, f"sidecar: written beside the image ({p.stderr[-200:]})")
+if rec:
+    check(g["20"] == {"class_type": "PreviewAny", "inputs": {"source": ["11", 0]}}, "sidecar: node 20 is PreviewAny on the upsampler")
+    check(rec["caption"] == CAPTION and rec["prompt"] == "yacht", "sidecar: caption is the upsampler's text, prompt the argument")
+    check(rec["seed"] == 42 and rec["size"] == "512x768" and rec["enhance"] is True, "sidecar: seed, size, enhance")
+    check((rec["steps"], rec["cfg"], rec["sampler"], rec["scheduler"]) == (16, 1, "euler", "simple"), "sidecar: sampler settings")
+    check(rec["graph"] == "flux3-klein" and rec["graph_sha256"] == hashlib.sha256(open(os.path.join(root, "client", "graphs", "flux3-klein.json"), "rb").read()).hexdigest(), "sidecar: graph name and sha256")
+    check(rec["client_sha256"] == hashlib.sha256(open(tool, "rb").read()).hexdigest(), "sidecar: client sha256")
+    check(rec["models"] == {"1": "flux3-image-klein-int8-convrot.safetensors", "2": "qwen3vl_4b_int8_convrot.safetensors",
+                            "3": "flux2-vae.safetensors", "10": "qwen3.5_9b_flux3_prompt_upsampler_w4a8.safetensors"}, "sidecar: models from the loader nodes")
+    check(rec["refs"] == [] and rec["margin"] is None and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", rec["utc"]), "sidecar: no refs, no margin, utc stamp")
+p, g, rec = record("--no-enhance", "--seed", "7", "plain cap")
+check(rec is not None and rec["caption"] == "plain cap" and rec["enhance"] is False and "20" not in g and "10" not in rec["models"], "no-enhance sidecar: caption is the prompt, no node 20")
+p, g, rec = record("--ref", refs[0], "--no-enhance", "cap <ref_image_0>")
+check(rec is not None and rec["refs"] == [{"name": "r0.png", "sha256": hashlib.sha256(PNG).hexdigest()}] and rec["graph"] == "flux3-klein-edit"
+      and rec["vision"] is False and rec["encoder"] == {"node": "4", "class_type": "CLIPTextEncode"}, "edit sidecar: ref name and content hash, edit graph, no vision")
+p, g, rec = record("--ref", refs[0], "--vision", "cap <ref_image_0>")
+check(rec is not None and rec["caption"] == CAPTION and "20" in g and rec["vision"] is True
+      and rec["encoder"] == {"node": "4", "class_type": "TextEncodeQwenImageEditPlus"}, "vision edit sidecar: upsampler caption, vision on, vision encoder")
+check(rec is not None and 2 <= rec["seconds"] < 120, f"sidecar: seconds recorded ({rec and rec.get('seconds')})")
+# upsampler on but node 20 missing from history: fail loudly, write nothing
+seen["drop20"] = True
+for f in ("o.png", "o.json"):
+    if has(f): os.remove(os.path.join(tmp, f))
+p, g = run("yacht")
+check(p.returncode != 0 and "no caption" in p.stderr and not has("o.png") and not has("o.json") and "Traceback" not in p.stderr, f"no caption in history: fails, writes nothing ({p.returncode} {p.stderr[-160:]})")
+p, g = run("--caption-only", "yacht")
+check(p.returncode != 0 and p.stdout == "", "caption-only with no caption in history: fails")
+seen["drop20"] = False
+p, g = run("-n", "2", "--no-enhance", "cap")
+check(has("o-1.json") and has("o-2.json"), "-n 2: one sidecar per image")
+refused(["-o", os.path.join(tmp, "x.json"), "cap"], "must not end in .json", "--out .json")
+for f in ("o.png", "o.json"):
+    if has(f): os.remove(os.path.join(tmp, f))
+p, g = run("--caption-only", "--seed", "3", "yacht")
+check(p.returncode == 0 and p.stdout == CAPTION + chr(10) and p.stderr == "" and seen["free"] == 0, f"caption-only: stdout is the caption ({p.stdout!r} {p.stderr[-200:]})")
+check(g is not None and sorted(g) == ["10", "11", "20"], f"caption-only: graph is nodes 10, 11, 20 only ({sorted(g or [])})")
+check(g is not None and g["11"]["inputs"]["prompt"] == "TARGET CANVAS: 3:2\nyacht", "caption-only: upsampler prompt as a render would send it")
+check(not has("o.png") and not has("o.json"), "caption-only: no file written")
+p, g = run("--caption-only", "yacht", keep=False)
+check(p.returncode == 0 and p.stdout == CAPTION + chr(10) and seen["free"] == 1 and "freed" in p.stderr, f"caption-only frees Raven's VRAM, on stderr ({seen['free']} {p.stderr[-100:]})")
+for args, w in ((["--no-enhance"], "--no-enhance"), (["--ref", refs[0]], "--ref"), (["--margin", "5"], "--margin")):
+    refused(["--caption-only", *args, "cap"], "cannot be combined", "caption-only with " + w)
+
+# a margin render records its margin and backdrop beside the cleared image
+seen["view"] = mkpng(160, 160, lambda x, y: BG)
+p, g, rec = record("--margin", "6", "--bg", "1ec85a", "--size", "160x160", "cap")
+check(p.returncode == 0 and rec is not None and rec["margin"] == 6 and rec["bg"] == "1ec85a", f"margin sidecar: margin and bg ({p.stderr[-200:]})")
 
 srv.shutdown()
 print(f"{count[0] - len(fails)}/{count[0]} checks passed")

@@ -5,7 +5,7 @@ Talks to ComfyUI's own API: POST /prompt, poll GET /history/<id>, GET /view,
 POST /free when the queue is empty. No retry loop: an unreachable Raven exits 75
 with "Raven may be busy or off". See README.md next to this file.
 """
-import argparse, json, math, os, random, re, stat, struct, sys, time, urllib.error, urllib.parse, urllib.request, zlib
+import argparse, datetime, hashlib, json, math, os, random, re, stat, struct, sys, time, urllib.error, urllib.parse, urllib.request, zlib
 
 BASE = os.environ.get("RAVEN_URL", "http://10.77.0.4:8190")
 EX_BUSY = 75  # EX_TEMPFAIL: no answer from Raven (off, busy, a read timeout mid-render, or a lock screen after a reboot); try again later, by hand
@@ -115,6 +115,7 @@ def build(name, text, w, h, seed, enhance, refs=(), vision=False):
     if enhance:
         d = math.gcd(w, h)
         g["11"]["inputs"]["prompt"] = text if refs else f"TARGET CANVAS: {w // d}:{h // d}\n{text}"
+        g["20"] = {"class_type": "PreviewAny", "inputs": {"source": ["11", 0]}}  # the caption, in history beside the image
     else:
         for k in ("10", "11"):
             del g[k]
@@ -256,7 +257,11 @@ def clear_edges(png, pct, alpha=False, bg=None):
     return png_encode(w, h, bpp, rows, keep), back, clip, band
 
 
-def render(g, timeout):
+def render(g, timeout, caption_only=False):
+    """Run graph g; returns (png, caption). The caption is node 20's PreviewAny text, the upsampler's exact output, else the
+    text node 4 was given. caption_only: g holds no image node, png is None."""
+    enc = g.get("4", {}).get("inputs", {})
+    given = enc.get("text", enc.get("prompt"))
     try:
         r = json.loads(call("POST", "/prompt", {"prompt": g, "client_id": "raven-image"}))
     except urllib.error.HTTPError as e:
@@ -272,13 +277,41 @@ def render(g, timeout):
         if st.get("status_str") == "error":
             msgs = [m for m in st.get("messages", []) if m[0] == "execution_error"]
             sys.exit(f"raven-image: render failed: {json.dumps(msgs[-1][1] if msgs else st)[:800]}")
-        for out in h.get("outputs", {}).values():
+        outs = h.get("outputs", {})
+        text = outs.get("20", {}).get("text")
+        caption = text[0] if text else None if "20" in g else given if isinstance(given, str) else None
+        if caption_only and caption is not None:
+            return None, caption
+        for out in () if caption_only else outs.values():
             for im in out.get("images", []):
+                if caption is None:  # the record must hold the exact prompt: no caption, no image
+                    sys.exit("raven-image: history has no caption from the upsampler (node 20); nothing written")
                 q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im["subfolder"], "type": im["type"]})
-                return call("GET", "/view?" + q, timeout=120)
+                return call("GET", "/view?" + q, timeout=120), caption
         if st.get("completed"):
-            sys.exit("raven-image: render completed with no image")
+            sys.exit("raven-image: completed with no caption" if caption_only else "raven-image: render completed with no image")
     sys.exit(f"raven-image: no image after {timeout}s (prompt {pid} may still be running on Raven)")
+
+
+def sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def write_record(path, a, g, seed, w, h, caption, bg, seconds, ref_data):
+    """The image's record, beside it: what Raven was asked and the exact text its encoder saw."""
+    s = g["7"]["inputs"]
+    rec = {"client_sha256": sha256(os.path.realpath(__file__)), "graph": a.graph,
+           "graph_sha256": sha256(os.path.join(graph_dir(), a.graph + ".json")),
+           "models": {k: n["inputs"][f] for k, n in g.items() for f in ("unet_name", "clip_name", "vae_name") if f in n.get("inputs", {})},
+           "size": f"{w}x{h}", "seed": seed, "steps": s["steps"], "cfg": s["cfg"], "sampler": s["sampler_name"], "scheduler": s["scheduler"],
+           "enhance": "11" in g, "prompt": a.prompt, "caption": caption, "refs": [{"name": safe_name(r), "sha256": hashlib.sha256(d).hexdigest()} for r, d in zip(a.ref, ref_data)],
+           "vision": a.vision, "encoder": {"node": "4", "class_type": g["4"]["class_type"]}, "margin": a.margin,
+           "bg": "%06x" % bg if a.margin else None, "seconds": round(seconds, 1),
+           "utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False, indent=1)
+        f.write(chr(10))
 
 
 def free_if_idle():
@@ -309,6 +342,8 @@ def main():
     ap.add_argument("--alpha", action="store_true", help="--margin: key the backdrop connected to the band to transparent (RGBA output)")
     ap.add_argument("--max-clip", type=float, default=0.5, metavar="PCT", help="--margin: largest %% of the band that may need clearing (default 0.5)")
     ap.add_argument("--no-enhance", action="store_true", help="send the prompt as the caption, skip the upsampler")
+    ap.add_argument("--caption-only", action="store_true",
+                    help="run only the upsampler, print the caption it makes of the prompt and render nothing (no file written)")
     ap.add_argument("--timeout", type=int, default=900, help="seconds to wait per image")
     ap.add_argument("--keep-loaded", action="store_true", help="skip POST /free at the end")
     a = ap.parse_args()
@@ -318,6 +353,10 @@ def main():
         ap.error("--ref and graph flux3-klein-edit go together (the edit graph needs refs, other graphs cannot take them)")
     if a.margin is not None and not 0 < a.margin <= 40:
         ap.error("--margin is a percentage above 0 and at most 40")
+    if a.caption_only and (a.no_enhance or a.ref or a.margin is not None):
+        ap.error("--caption-only previews the upsampler and cannot be combined with --no-enhance, --ref or --margin")
+    if os.path.splitext(a.out)[1].lower() == ".json":
+        ap.error("--out must not end in .json: that name is the image's record")
     if a.alpha and not a.margin:
         ap.error("--alpha needs --margin")
     if not re.fullmatch(r"#?[0-9a-fA-F]{6}", a.bg):
@@ -335,6 +374,13 @@ def main():
     dirty = broken = 0
     try:
         call("GET", "/system_stats", timeout=5)
+        if a.caption_only:
+            g = build(a.graph, a.prompt, w, h, seed0, True)
+            _, caption = render({k: g[k] for k in ("10", "11", "20")}, a.timeout, True)
+            print(caption)
+            if not a.keep_loaded:
+                print("freed Raven's VRAM" if free_if_idle() else "queue not empty, left models loaded", file=sys.stderr)
+            return
         refs = [upload(r, d) for r, d in zip(a.ref, ref_data)]
         for i in range(a.n):
             seed = seed0 + i
@@ -342,7 +388,7 @@ def main():
             g = build(a.graph, a.prompt, w, h, seed, not a.no_enhance, refs, a.vision)
             if a.margin:
                 pin_edges(g, w, h, a.margin, bg)
-            png = render(g, a.timeout)
+            png, caption = render(g, a.timeout)
             note = ""
             if a.margin:
                 try:
@@ -359,6 +405,7 @@ def main():
             path = a.out if a.n == 1 else f"{root}-{i + 1}{ext}"
             with open(path, "wb") as f:
                 f.write(png)
+            write_record(os.path.splitext(path)[0] + ".json", a, g, seed, w, h, caption, bg, time.time() - t, ref_data)
             print(f"{path}  seed={seed}  {w}x{h}  {time.time() - t:.0f}s{note}", flush=True)
         if not a.keep_loaded:
             print("freed Raven's VRAM" if free_if_idle() else "queue not empty, left models loaded")
