@@ -8,7 +8,7 @@ root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.
 tool = os.path.join(root, "client", "raven-image")
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
 CAPTION = "Full-color photograph, a small private space yacht moored at a dock, soft light."
-seen = {"uploads": [], "prompts": [], "view": PNG}
+seen = {"uploads": [], "prompts": [], "view": PNG, "drop20": False, "free": 0}
 
 
 class H(BaseHTTPRequestHandler):
@@ -20,7 +20,7 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/history/"):
             g, outs = seen["prompts"][-1], {}  # like ComfyUI, report only the output nodes the posted graph has
             if "9" in g: outs["9"] = {"images": [{"filename": "x.png", "subfolder": "", "type": "temp"}]}
-            if "20" in g: outs["20"] = {"text": [CAPTION]}
+            if "20" in g and not seen["drop20"]: outs["20"] = {"text": [CAPTION]}
             self.send(json.dumps({self.path[9:]: {"status": {"completed": True}, "outputs": outs}}).encode())
         elif self.path.startswith("/view"): self.send(seen["view"], "image/png")
         elif self.path == "/queue": self.send(b'{"queue_running":[],"queue_pending":[]}')
@@ -29,6 +29,7 @@ class H(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         if self.path == "/upload/image":
             seen["uploads"].append(body); self.send(json.dumps({"name": "stored%d.png" % len(seen["uploads"])}).encode())
+        elif self.path == "/free": seen["free"] += 1; self.send(b"{}")
         elif self.path == "/prompt":
             seen["prompts"].append(json.loads(body)["prompt"]); self.send(b'{"prompt_id":"p1"}')
         else: self.send(b"{}")
@@ -48,11 +49,13 @@ def check(cond, what):
         fails.append(what); print("FAIL:", what)
 
 
-def run(*args, url=url):
-    seen["uploads"].clear(); seen["prompts"].clear()
+def run(*args, url=url, keep=True):
+    seen["uploads"].clear(); seen["prompts"].clear(); seen["free"] = 0
     env = dict(os.environ, RAVEN_URL=url)
-    p = subprocess.run([sys.executable, "-I", tool, "--keep-loaded", "-o", os.path.join(tmp, "o.png"), *args],
+    p = subprocess.run([sys.executable, "-I", tool, *(["--keep-loaded"] if keep else []), "-o", os.path.join(tmp, "o.png"), *args],
                        capture_output=True, text=True, env=env, timeout=120)
+    for g in seen["prompts"]:  # images stay PreviewImage and never reach Deru's playground history
+        check(all(n["class_type"] != "SaveImage" for n in g.values()), f"no SaveImage in the posted graph ({' '.join(args)[:60]})")
     return p, (seen["prompts"][0] if seen["prompts"] else None)
 
 
@@ -349,19 +352,33 @@ if rec:
 p, g, rec = record("--no-enhance", "--seed", "7", "plain cap")
 check(rec is not None and rec["caption"] == "plain cap" and rec["enhance"] is False and "20" not in g and "10" not in rec["models"], "no-enhance sidecar: caption is the prompt, no node 20")
 p, g, rec = record("--ref", refs[0], "--no-enhance", "cap <ref_image_0>")
-check(rec is not None and rec["refs"] == ["r0.png"] and rec["graph"] == "flux3-klein-edit", "edit sidecar: sanitised ref name, edit graph")
+check(rec is not None and rec["refs"] == [{"name": "r0.png", "sha256": hashlib.sha256(PNG).hexdigest()}] and rec["graph"] == "flux3-klein-edit"
+      and rec["vision"] is False and rec["encoder"] == {"node": "4", "class_type": "CLIPTextEncode"}, "edit sidecar: ref name and content hash, edit graph, no vision")
 p, g, rec = record("--ref", refs[0], "--vision", "cap <ref_image_0>")
-check(rec is not None and rec["caption"] == CAPTION and "20" in g, "vision edit sidecar: upsampler caption")
+check(rec is not None and rec["caption"] == CAPTION and "20" in g and rec["vision"] is True
+      and rec["encoder"] == {"node": "4", "class_type": "TextEncodeQwenImageEditPlus"}, "vision edit sidecar: upsampler caption, vision on, vision encoder")
+check(rec is not None and 2 <= rec["seconds"] < 120, f"sidecar: seconds recorded ({rec and rec.get('seconds')})")
+# upsampler on but node 20 missing from history: fail loudly, write nothing
+seen["drop20"] = True
+for f in ("o.png", "o.json"):
+    if has(f): os.remove(os.path.join(tmp, f))
+p, g = run("yacht")
+check(p.returncode != 0 and "no caption" in p.stderr and not has("o.png") and not has("o.json") and "Traceback" not in p.stderr, f"no caption in history: fails, writes nothing ({p.returncode} {p.stderr[-160:]})")
+p, g = run("--caption-only", "yacht")
+check(p.returncode != 0 and p.stdout == "", "caption-only with no caption in history: fails")
+seen["drop20"] = False
 p, g = run("-n", "2", "--no-enhance", "cap")
 check(has("o-1.json") and has("o-2.json"), "-n 2: one sidecar per image")
 refused(["-o", os.path.join(tmp, "x.json"), "cap"], "must not end in .json", "--out .json")
 for f in ("o.png", "o.json"):
     if has(f): os.remove(os.path.join(tmp, f))
 p, g = run("--caption-only", "--seed", "3", "yacht")
-check(p.returncode == 0 and p.stdout.strip() == CAPTION and p.stderr == "", f"caption-only: stdout is the caption ({p.stdout!r} {p.stderr[-200:]})")
+check(p.returncode == 0 and p.stdout == CAPTION + chr(10) and p.stderr == "" and seen["free"] == 0, f"caption-only: stdout is the caption ({p.stdout!r} {p.stderr[-200:]})")
 check(g is not None and sorted(g) == ["10", "11", "20"], f"caption-only: graph is nodes 10, 11, 20 only ({sorted(g or [])})")
 check(g is not None and g["11"]["inputs"]["prompt"] == "TARGET CANVAS: 3:2\nyacht", "caption-only: upsampler prompt as a render would send it")
 check(not has("o.png") and not has("o.json"), "caption-only: no file written")
+p, g = run("--caption-only", "yacht", keep=False)
+check(p.returncode == 0 and p.stdout == CAPTION + chr(10) and seen["free"] == 1 and "freed" in p.stderr, f"caption-only frees Raven's VRAM, on stderr ({seen['free']} {p.stderr[-100:]})")
 for args, w in ((["--no-enhance"], "--no-enhance"), (["--ref", refs[0]], "--ref"), (["--margin", "5"], "--margin")):
     refused(["--caption-only", *args, "cap"], "cannot be combined", "caption-only with " + w)
 

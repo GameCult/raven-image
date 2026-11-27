@@ -278,12 +278,14 @@ def render(g, timeout, caption_only=False):
             msgs = [m for m in st.get("messages", []) if m[0] == "execution_error"]
             sys.exit(f"raven-image: render failed: {json.dumps(msgs[-1][1] if msgs else st)[:800]}")
         outs = h.get("outputs", {})
-        text = outs.get("20", {}).get("text") or [given if isinstance(given, str) else None]
-        caption = text[0]
-        if caption_only and outs.get("20", {}).get("text"):
+        text = outs.get("20", {}).get("text")
+        caption = text[0] if text else None if "20" in g else given if isinstance(given, str) else None
+        if caption_only and caption is not None:
             return None, caption
         for out in () if caption_only else outs.values():
             for im in out.get("images", []):
+                if caption is None:  # the record must hold the exact prompt: no caption, no image
+                    sys.exit("raven-image: history has no caption from the upsampler (node 20); nothing written")
                 q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im["subfolder"], "type": im["type"]})
                 return call("GET", "/view?" + q, timeout=120), caption
         if st.get("completed"):
@@ -296,14 +298,15 @@ def sha256(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def write_record(path, a, g, seed, w, h, caption, bg, seconds):
+def write_record(path, a, g, seed, w, h, caption, bg, seconds, ref_data):
     """The image's record, beside it: what Raven was asked and the exact text its encoder saw."""
     s = g["7"]["inputs"]
     rec = {"client_sha256": sha256(os.path.realpath(__file__)), "graph": a.graph,
            "graph_sha256": sha256(os.path.join(graph_dir(), a.graph + ".json")),
            "models": {k: n["inputs"][f] for k, n in g.items() for f in ("unet_name", "clip_name", "vae_name") if f in n.get("inputs", {})},
            "size": f"{w}x{h}", "seed": seed, "steps": s["steps"], "cfg": s["cfg"], "sampler": s["sampler_name"], "scheduler": s["scheduler"],
-           "enhance": "11" in g, "prompt": a.prompt, "caption": caption, "refs": [safe_name(r) for r in a.ref], "margin": a.margin,
+           "enhance": "11" in g, "prompt": a.prompt, "caption": caption, "refs": [{"name": safe_name(r), "sha256": hashlib.sha256(d).hexdigest()} for r, d in zip(a.ref, ref_data)],
+           "vision": a.vision, "encoder": {"node": "4", "class_type": g["4"]["class_type"]}, "margin": a.margin,
            "bg": "%06x" % bg if a.margin else None, "seconds": round(seconds, 1),
            "utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     with open(path, "w", encoding="utf-8") as f:
@@ -402,7 +405,7 @@ def main():
             path = a.out if a.n == 1 else f"{root}-{i + 1}{ext}"
             with open(path, "wb") as f:
                 f.write(png)
-            write_record(os.path.splitext(path)[0] + ".json", a, g, seed, w, h, caption, bg, time.time() - t)
+            write_record(os.path.splitext(path)[0] + ".json", a, g, seed, w, h, caption, bg, time.time() - t, ref_data)
             print(f"{path}  seed={seed}  {w}x{h}  {time.time() - t:.0f}s{note}", flush=True)
         if not a.keep_loaded:
             print("freed Raven's VRAM" if free_if_idle() else "queue not empty, left models loaded")
